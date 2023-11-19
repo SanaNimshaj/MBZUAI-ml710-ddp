@@ -1,5 +1,6 @@
 import os
 import random
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -26,16 +27,17 @@ import utils
 
 #*******************************************************************************
 
-approx_steps = 20000
+approx_steps = 400
 workers = 4
 batch_size = 64
 learning_rate =  0.001 #0.0001
 
 # Set the number of GPUs
-world_size = 1
+world_size = 4
 Method_Work = "powersgd"  #  ddp / quantize / powersgd / fsdp / topk
 
 Rank_Adder = 0
+top_k_ration = 20
 
 log_path = f"Logs/exp04-{Method_Work}-{world_size}gpu-32im-Res18/"
 os.makedirs(log_path, exist_ok=True)
@@ -103,35 +105,115 @@ def get_model_stuffs(rank):
 
 #*******************************************************************************
 
+# class TopKSparsificationState:
+#     def __init__(self, process_group, k_ratio):
+#         group_to_use = process_group if process_group is not None else dist.group.WORLD
+#         self.process_group = group_to_use
+#         self.k_ratio = k_ratio
+#         self.grad_shape = (0,)
+#         self.device = 0
+
+#     def sparsify_gradients(self, tensor):
+#         flat_tensor = tensor#.flatten()
+#         k_count = int( len(flat_tensor) // self.k_ratio )
+#         abs_tensor = flat_tensor.abs()
+#         topk_values, topk_indices = torch.topk(abs_tensor, k_count, sorted=False)
+#         mask = torch.zeros_like(flat_tensor, dtype=torch.bool)
+#         mask.scatter_(0, topk_indices, True)
+#         sparsified_tensor = flat_tensor * mask
+#         # sparsified_tensor = sparsified_tensor.reshape(tensor.shape)
+#         return sparsified_tensor
+
+# ###---old way HOOK
+# def topk_sparsification_hook(state, bucket):
+#     tensor = bucket.buffer()
+#     process_group = state.process_group
+#     sparsified_tensor = state.sparsify_gradients(tensor)
+#     dist.all_reduce(sparsified_tensor, op=dist.ReduceOp.AVG,
+#                     group=process_group)
+#     # sparsified_tensor.to_dense()
+#     return default_hooks._allreduce_fut(process_group, sparsified_tensor)
+
+##------------------------------------------------------------------------------
+
 
 class TopKSparsificationState:
     def __init__(self, process_group, k_ratio):
         group_to_use = process_group if process_group is not None else dist.group.WORLD
         self.process_group = group_to_use
         self.k_ratio = k_ratio
+        self.gradient_holder = {}
 
-    def sparsify_gradients(self, tensor):
-        flat_tensor = tensor#.flatten()
-        k_count = int( len(flat_tensor) // self.k_ratio )
-        abs_tensor = flat_tensor.abs()
-        topk_values, topk_indices = torch.topk(abs_tensor, k_count, sorted=False)
-        mask = torch.zeros_like(flat_tensor, dtype=torch.bool)
-        mask.scatter_(0, topk_indices, True)
-        sparsified_tensor = flat_tensor * mask
-        # sparsified_tensor = sparsified_tensor.reshape(tensor.shape)
-        return sparsified_tensor #.to_sparse()
+    def get_gradient_accumulated(self, tensor):
+        dic_key = tensor.shape[0]
+        if not torch.is_tensor(self.gradient_holder.get(dic_key)):
+            self.gradient_holder[dic_key] = torch.zeros( tensor.shape, device=tensor.device,
+                             dtype =tensor.dtype,)
+        self.gradient_holder[dic_key] += tensor
+
+        return self.gradient_holder[dic_key]
+
+    def subtract_accounted_gradients(self, tensor):
+        dic_key = tensor.shape[0]
+        self.gradient_holder[dic_key] -= tensor
+
 
 def topk_sparsification_hook(state, bucket):
-    process_group = state.process_group
+    group_to_use = state.process_group
     tensor = bucket.buffer()
-    sparsified_tensor = state.sparsify_gradients(tensor)
-    # dist.all_reduce(sparsified_tensor, op=dist.ReduceOp.AVG,
-    #                 group=process_group)
-    # sparsified_tensor.to_dense()
+    device = tensor.device
+    # print(tensor.shape)
+    grad_shape = tensor.shape
 
-    # return sparsified_tensor.get_future()
-    return default_hooks._allreduce_fut(process_group, sparsified_tensor)
+    acc_tensor = tensor #state.get_gradient_accumulated(tensor)
 
+    def custom_sparsify_gradients(flat_tensor):
+        k_count = int( len(flat_tensor) // state.k_ratio )
+        abs_tensor = flat_tensor.abs()
+        topk_values, topk_indx = torch.topk(abs_tensor, k_count, sorted=False)
+
+        return topk_values, topk_indx
+
+
+    def get_allgather_out_list(all_gather_in_list):
+        out_list = [ torch.zeros_like(
+                    all_gather_in_list,
+                    device=all_gather_in_list.device,
+                    dtype=all_gather_in_list.dtype,)
+            for _ in range(group_to_use.size())
+        ]
+        return out_list
+
+
+    topk_vals, topk_indx = custom_sparsify_gradients(acc_tensor)
+
+    all_topk_vals = get_allgather_out_list(topk_vals)
+    all_topk_indx = get_allgather_out_list(topk_indx)
+
+    fut_vals = dist.all_gather( all_topk_vals, topk_vals, group=group_to_use,
+                               async_op=True).get_future()
+    fut_indx = dist.all_gather( all_topk_indx, topk_indx, group=group_to_use,
+                               async_op=True).get_future()
+
+    def custom_densify_gradients(fut_vals):
+        all_vals = fut_vals.wait()[0]
+        all_indx = fut_indx.wait()[0]
+
+        topk_vals_dense = torch.zeros(grad_shape, device=device, dtype=torch.float32)
+
+        for r, (vals, indx) in enumerate(zip(all_vals, all_indx)):
+            topk_vals_dense[indx] += vals
+
+        out_tensor  = topk_vals_dense / world_size
+
+        # state.subtract_accounted_gradients(out_tensor)
+        return out_tensor
+
+    return fut_vals.then(custom_densify_gradients)
+
+
+
+#*******************************************************************************
 
 class GradientQuantizationState:
     """TODO: Errorful state to be fixed """
@@ -206,8 +288,10 @@ def main(rank, world_size):
         dist_model.register_comm_hook(powersgd_state, powersgd_hook)
 
     elif Method_Work == "topk":
-        topk_state = TopKSparsificationState(process_group, 10)
+        print("SET TopK-sparsify>>>")
+        topk_state = TopKSparsificationState(process_group, top_k_ration)
         dist_model.register_comm_hook(topk_state, topk_sparsification_hook)
+        # dist_model.register_comm_hook(process_group, topk_sparsification_hook)
 
     elif Method_Work == "quantize":
         # quant_state = GradientQuantizationState(process_group, 16)
@@ -289,3 +373,4 @@ if __name__ == '__main__':
 
     # Use the spawn method for multiprocessing with DDP
     mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
+
