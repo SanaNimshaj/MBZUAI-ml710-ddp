@@ -26,10 +26,10 @@ import utils
 
 #*******************************************************************************
 
-approx_steps = 200
+approx_steps = 20000
 workers = 4
 batch_size = 64
-learning_rate =  0.001 #0.0001
+learning_rate =  0.0001 #0.0001
 
 # Set the number of GPUs
 world_size = 4
@@ -37,7 +37,7 @@ Method_Work = "quantize"  #  ddp / quantize / powersgd / fsdp / topk
 
 Rank_Adder = 0
 
-log_path = f"Logs/exp03-{Method_Work}-{world_size}gpu-224im-Res18/"
+log_path = f"Logs/exp04-{Method_Work}-{world_size}gpu-32im-Res18/"
 os.makedirs(log_path, exist_ok=True)
 
 os.environ['MASTER_ADDR'] = ADDR = 'localhost'
@@ -52,7 +52,7 @@ def get_data_stuffs():
         train=True,
         download=True,
         transform=torchvision.transforms.Compose([
-            torchvision.transforms.Resize((224, 224)),
+            # torchvision.transforms.Resize((224, 224)),
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
@@ -72,6 +72,7 @@ def get_data_stuffs():
         train=False,
         download=True,
         transform=torchvision.transforms.Compose([
+            # torchvision.transforms.Resize((224, 224)),
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
@@ -130,6 +131,7 @@ def topk_sparsification_hook(state, bucket):
 
 
 class GradientQuantizationState:
+    """TODO: Errorful state to be fixed """
     def __init__(self, process_group, quant_bits):
         self.process_group = process_group
         self.quant_bits = quant_bits
@@ -148,6 +150,7 @@ class GradientQuantizationState:
         return tensor
 
 def gradient_quantization_hook(state, bucket):
+    """TODO: Errorful state to be fixed """
 
     process_group = state.process_group
     tensor = bucket.buffer()
@@ -201,8 +204,9 @@ def main(rank, world_size):
         dist_model.register_comm_hook(topk_state, topk_sparsification_hook)
 
     elif Method_Work == "quantize":
-        quant_state = GradientQuantizationState(process_group, 16)
-        dist_model.register_comm_hook(quant_state, gradient_quantization_hook)
+        # quant_state = GradientQuantizationState(process_group, 16)
+        # dist_model.register_comm_hook(quant_state, gradient_quantization_hook)
+        dist_model.register_comm_hook(process_group, quantization_hooks.quantization_pertensor_hook) ##-->>>
 
 
 
