@@ -29,11 +29,11 @@ import utils
 approx_steps = 20000
 workers = 4
 batch_size = 64
-learning_rate =  0.0001 #0.0001
+learning_rate =  0.001 #0.0001
 
 # Set the number of GPUs
-world_size = 4
-Method_Work = "quantize"  #  ddp / quantize / powersgd / fsdp / topk
+world_size = 1
+Method_Work = "powersgd"  #  ddp / quantize / powersgd / fsdp / topk
 
 Rank_Adder = 0
 
@@ -88,23 +88,26 @@ def get_model_stuffs(rank):
     model = torchvision.models.resnet18(weights=None)
     in_features = model.fc.in_features
     model.fc = nn.Linear(in_features, 10)
-    model = model.to(rank)
+    model_copy = copy.deepcopy(model)
 
-    if Method_Work == "fsdp":
+    model = model.to(rank)
+    if "fsdp" in Method_Work:
+        print("SET fsdp>>>")
         my_auto_wrap_policy = functools.partial(
                 size_based_auto_wrap_policy, min_num_params=100000 )
         dist_model = FSDP(model, auto_wrap_policy=my_auto_wrap_policy)
     else:
         dist_model = DDP(model, device_ids=[rank])
 
-    return dist_model, model
+    return dist_model, model_copy
 
 #*******************************************************************************
 
 
 class TopKSparsificationState:
     def __init__(self, process_group, k_ratio):
-        self.process_group = process_group
+        group_to_use = process_group if process_group is not None else dist.group.WORLD
+        self.process_group = group_to_use
         self.k_ratio = k_ratio
 
     def sparsify_gradients(self, tensor):
@@ -116,53 +119,54 @@ class TopKSparsificationState:
         mask.scatter_(0, topk_indices, True)
         sparsified_tensor = flat_tensor * mask
         # sparsified_tensor = sparsified_tensor.reshape(tensor.shape)
-        return sparsified_tensor.to_sparse()
+        return sparsified_tensor #.to_sparse()
 
 def topk_sparsification_hook(state, bucket):
     process_group = state.process_group
     tensor = bucket.buffer()
     sparsified_tensor = state.sparsify_gradients(tensor)
-    dist.all_reduce(sparsified_tensor, op=dist.ReduceOp.AVG,
-                    group=process_group)
-    sparsified_tensor.to_dense()
+    # dist.all_reduce(sparsified_tensor, op=dist.ReduceOp.AVG,
+    #                 group=process_group)
+    # sparsified_tensor.to_dense()
 
-    return sparsified_tensor.get_future()
-    # return default_hooks._allreduce_fut(process_group, sparsified_tensor)
+    # return sparsified_tensor.get_future()
+    return default_hooks._allreduce_fut(process_group, sparsified_tensor)
 
 
 class GradientQuantizationState:
     """TODO: Errorful state to be fixed """
     def __init__(self, process_group, quant_bits):
-        self.process_group = process_group
+        group_to_use = process_group if process_group is not None else dist.group.WORLD
+        self.process_group = group_to_use
         self.quant_bits = quant_bits
 
     def quantize(self, tensor):
         max_val = tensor.abs().max()
         scale = max_val / (2**self.quant_bits - 1)
         zero_point = 0
-        quant_tensor = torch.round(tensor / scale) + zero_point
-        quant_tensor = torch.clamp(quant_tensor, 0, 255).to(torch.uint8)
+        quant_tensor = torch.quantize_per_tensor(tensor, scale, zero_point, torch.quint8)
         return quant_tensor, scale
 
-    def dequantize(quant_tensor, scale):
-        zero_point = 0
-        tensor = scale * (quant_tensor.to(torch.float32) - zero_point)
+    def dequantize(self, quant_tensor):
+        tensor = quant_tensor.dequantize()
         return tensor
 
 def gradient_quantization_hook(state, bucket):
     """TODO: Errorful state to be fixed """
-
     process_group = state.process_group
+    world_size    = process_group.size()
     tensor = bucket.buffer()
     quant_tensor, scale = state.quantize(tensor)
-    dist.all_reduce(quant_tensor, op=dist.ReduceOp.AVG,
-                    group=process_group)
-    dist.all_reduce(scale, op=dist.ReduceOp.AVG,
-                    group=process_group)
+
+    quant_tensor = default_hooks._allreduce_fut(process_group, quant_tensor)
+    scale        = default_hooks._allreduce_fut(process_group, scale)
+
+    quant_tensor = quant_tensor / world_size
+    scale        = scale / world_size
+
     dequant_tensor = state.dequantize(quant_tensor, scale)
 
-
-    return dequant_tensor.get_future()
+    return dequant_tensor
 
 
 ##==============================================================================
@@ -177,6 +181,7 @@ def main(rank, world_size):
         world_size=world_size,
         rank=rank,
     )
+    print(rank)
 
     torch.cuda.set_device(rank)
 
@@ -191,7 +196,8 @@ def main(rank, world_size):
     optimizer = optim.SGD(dist_model.parameters(), lr=learning_rate, momentum=0.9)
 
 
-    if Method_Work == "powersgd":
+    if "powersgd" in Method_Work:
+        print("SET powerSGD>>>")
         powersgd_hook  = powerSGD_hook.powerSGD_hook
         powersgd_state = powerSGD_hook.PowerSGDState(process_group=process_group,
                  matrix_approximation_rank=4, start_powerSGD_iter=10,
@@ -248,12 +254,19 @@ def main(rank, world_size):
     df.to_csv(log_path+f"/step-details-{rank}.csv", index=False)
 
     dist.barrier()
+    if "fsdp" in Method_Work: dist_state = dist_model.state_dict()
+
     if rank == 0:
         ## TEST Loop
-        dist_state = dist_model.state_dict()
-        dist_state = { k.replace("module.", ""):v  for k,v in dist_state.items() }
+        if "fsdp" in Method_Work:
+            pass
+        else:
+            dist_state = dist_model.state_dict()
+            dist_state = { k.replace("module.", ""):v  for k,v in dist_state.items() }
+
         model.load_state_dict(dist_state)
         model = model.to(rank)
+
         model.eval()
         total_correct = 0
         total_samples = 0
@@ -276,4 +289,3 @@ if __name__ == '__main__':
 
     # Use the spawn method for multiprocessing with DDP
     mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
-
