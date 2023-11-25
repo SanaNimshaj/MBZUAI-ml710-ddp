@@ -27,23 +27,23 @@ import utils
 
 #*******************************************************************************
 
-approx_steps = 400
+approx_steps = 20000
 workers = 4
-batch_size = 10240
+batch_size = 64
 learning_rate =  0.001 #0.0001
 
 # Set the number of GPUs
-world_size = 4
+world_size = 1
 Method_Work = "ddp"  #  ddp / quantize / powersgd / fsdp / topk
 
 Rank_Adder = 0
 top_k_ration = 10
 
-log_path = f"Logs/expXXX-{Method_Work}-B{batch_size}-{world_size}gpu-32im-Res18/"
+log_path = f"Logs/exp05-{Method_Work}-B{batch_size}-{world_size}gpu-224im-Res101/"
 os.makedirs(log_path, exist_ok=True)
 
 os.environ['MASTER_ADDR'] = ADDR = 'localhost'
-os.environ['MASTER_PORT'] = PORT ='12345'
+os.environ['MASTER_PORT'] = PORT ='12346'
 
 #*******************************************************************************
 
@@ -54,7 +54,7 @@ def get_data_stuffs():
         train=True,
         download=True,
         transform=torchvision.transforms.Compose([
-            # torchvision.transforms.Resize((224, 224)),
+            torchvision.transforms.Resize((224, 224)),
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
@@ -63,7 +63,7 @@ def get_data_stuffs():
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         dataset=train_dataset,
-        batch_size=batch_size // world_size,
+        batch_size=batch_size, # // world_size, ##CHECKUP
         shuffle=False,
         num_workers=workers,
         sampler=train_sampler
@@ -74,7 +74,7 @@ def get_data_stuffs():
         train=False,
         download=True,
         transform=torchvision.transforms.Compose([
-            # torchvision.transforms.Resize((224, 224)),
+            torchvision.transforms.Resize((224, 224)),
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
@@ -87,7 +87,7 @@ def get_data_stuffs():
 
 
 def get_model_stuffs(rank):
-    model = torchvision.models.resnet18(weights=None)
+    model = torchvision.models.resnet101(weights=None)
     in_features = model.fc.in_features
     model.fc = nn.Linear(in_features, 10)
     model_copy = copy.deepcopy(model)
